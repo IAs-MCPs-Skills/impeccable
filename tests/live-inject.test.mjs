@@ -5,14 +5,14 @@
 
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, writeFileSync, readFileSync, realpathSync, rmSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const INJECT = resolve(__dirname, '..', 'source/skills/impeccable/scripts/live-inject.mjs');
+const INJECT = resolve(__dirname, '..', 'skill/scripts/live-inject.mjs');
 
 function runInject(cwd, configPath, args) {
   try {
@@ -29,10 +29,58 @@ function runInject(cwd, configPath, args) {
   }
 }
 
+function runInjectDefault(cwd, args) {
+  try {
+    const out = execFileSync('node', [INJECT, ...args], {
+      cwd,
+      encoding: 'utf-8',
+      env: { ...process.env, IMPECCABLE_LIVE_CONFIG: '' },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    return JSON.parse(out.trim());
+  } catch (err) {
+    const body = err.stdout?.toString().trim() || err.stderr?.toString().trim() || '';
+    return JSON.parse(body || '{}');
+  }
+}
+
 describe('live-inject — insert/remove round-trip preserves file bytes', () => {
   let tmp;
   beforeEach(() => { tmp = mkdtempSync(join(tmpdir(), 'impeccable-inject-test-')); });
   afterEach(() => { rmSync(tmp, { recursive: true, force: true }); });
+
+  it('reports .impeccable/live/config.json as the default missing config path', () => {
+    const result = runInjectDefault(tmp, ['--check']);
+
+    assert.equal(result.ok, false);
+    assert.equal(result.error, 'config_missing');
+    assert.equal(result.path, join(realpathSync(tmp), '.impeccable', 'live', 'config.json'));
+  });
+
+  it('uses .impeccable/live/config.json without an environment override', () => {
+    const original = `<html>
+  <body>
+    <p>Content</p>
+  </body>
+</html>
+`;
+    writeFileSync(join(tmp, 'index.html'), original);
+    const configDir = join(tmp, '.impeccable', 'live');
+    mkdirSync(configDir, { recursive: true });
+    writeFileSync(join(configDir, 'config.json'), JSON.stringify({
+      files: ['index.html'],
+      insertBefore: '</body>',
+      commentSyntax: 'html',
+    }));
+
+    const inserted = runInjectDefault(tmp, ['--port', '8400']);
+    assert.equal(inserted.ok, true);
+    assert.match(readFileSync(join(tmp, 'index.html'), 'utf-8'), /localhost:8400\/live\.js/);
+
+    const removed = runInjectDefault(tmp, ['--remove']);
+    assert.equal(removed.ok, true);
+    assert.equal(readFileSync(join(tmp, 'index.html'), 'utf-8'), original);
+  });
 
   it('round-trips an HTML file without mangling indentation', () => {
     const original = `<!DOCTYPE html>
@@ -193,6 +241,83 @@ describe('live-inject — insert/remove round-trip preserves file bytes', () => 
     assert.equal(after, original, 'CSP meta tag must round-trip exactly through insert+remove');
   });
 
+  it('emits is:inline on script tag for .astro files (Astro otherwise rewrites src) and round-trips', () => {
+    const original = `---
+const title = 'Test';
+---
+<html>
+  <body>
+    <h1>{title}</h1>
+  </body>
+</html>
+`;
+    const file = join(tmp, 'Layout.astro');
+    writeFileSync(file, original);
+
+    const cfgPath = join(tmp, 'config.json');
+    writeFileSync(cfgPath, JSON.stringify({
+      files: ['Layout.astro'],
+      insertBefore: '</body>',
+      commentSyntax: 'html',
+    }));
+
+    runInject(tmp, cfgPath, ['--port', '8400']);
+    const afterInject = readFileSync(file, 'utf-8');
+    assert.match(afterInject, /<script is:inline src="http:\/\/localhost:8400\/live\.js"><\/script>/, 'astro inject should carry is:inline');
+
+    // Non-astro file with same config should NOT get is:inline
+    const htmlFile = join(tmp, 'plain.html');
+    writeFileSync(htmlFile, '<html><body><p>x</p></body></html>\n');
+    writeFileSync(cfgPath, JSON.stringify({
+      files: ['plain.html'],
+      insertBefore: '</body>',
+      commentSyntax: 'html',
+    }));
+    runInject(tmp, cfgPath, ['--port', '8400']);
+    const afterHtml = readFileSync(htmlFile, 'utf-8');
+    assert.doesNotMatch(afterHtml, /is:inline/, 'plain HTML must not get is:inline');
+
+    // Round-trip remove for the astro file
+    writeFileSync(cfgPath, JSON.stringify({
+      files: ['Layout.astro'],
+      insertBefore: '</body>',
+      commentSyntax: 'html',
+    }));
+    runInject(tmp, cfgPath, ['--remove']);
+    const afterRemove = readFileSync(file, 'utf-8');
+    assert.equal(afterRemove, original, 'astro file should round-trip cleanly after remove');
+  });
+
+  it('normalizes stale bare live script blocks in .astro files', () => {
+    const original = `---
+const title = 'Test';
+---
+<html>
+  <body>
+    <h1>{title}</h1>
+    <!-- impeccable-live-start -->
+    <script src="http://localhost:8400/live.js"></script>
+    <!-- impeccable-live-end --></body>
+</html>
+`;
+    const file = join(tmp, 'Layout.astro');
+    writeFileSync(file, original);
+
+    const cfgPath = join(tmp, 'config.json');
+    writeFileSync(cfgPath, JSON.stringify({
+      files: ['Layout.astro'],
+      insertBefore: '</body>',
+      commentSyntax: 'html',
+    }));
+
+    runInject(tmp, cfgPath, ['--port', '8400']);
+    const afterInject = readFileSync(file, 'utf-8');
+
+    assert.equal((afterInject.match(/impeccable-live-start/g) || []).length, 1, 'reinjection should leave one live block');
+    assert.match(afterInject, /<script is:inline src="http:\/\/localhost:8400\/live\.js"><\/script>/, 'astro reinject should restore is:inline');
+    assert.doesNotMatch(afterInject, /<script src="http:\/\/localhost:8400\/live\.js"><\/script>/, 'bare astro live script must not survive');
+  });
+
   it('round-trips when the insert anchor has no leading indent (column-0 </body>)', () => {
     const original = `<html>
 <body>
@@ -215,5 +340,53 @@ describe('live-inject — insert/remove round-trip preserves file bytes', () => 
 
     const after = readFileSync(file, 'utf-8');
     assert.equal(after, original, 'column-0 anchor should round-trip cleanly too');
+  });
+
+  it('preserves the character after an insertAfter anchor with no trailing newline (#227)', () => {
+    const original = '<head>X</head>';
+    const file = join(tmp, 'compact.html');
+    writeFileSync(file, original);
+
+    const cfgPath = join(tmp, 'config.json');
+    writeFileSync(cfgPath, JSON.stringify({
+      files: ['compact.html'],
+      insertAfter: '<head>',
+      commentSyntax: 'html',
+    }));
+
+    runInject(tmp, cfgPath, ['--port', '8400']);
+    const afterInject = readFileSync(file, 'utf-8');
+
+    assert.ok(
+      afterInject.includes('<!-- impeccable-live-end -->\nX</head>'),
+      `the character immediately after <head> must survive injection, got:\n${afterInject}`
+    );
+  });
+
+  it('round-trips insertAfter files with CRLF newlines', () => {
+    const original = '<html>\r\n<head>\r\n  <title>X</title>\r\n</head>\r\n<body>Content</body>\r\n</html>\r\n';
+    const file = join(tmp, 'crlf.html');
+    writeFileSync(file, original);
+
+    const cfgPath = join(tmp, 'config.json');
+    writeFileSync(cfgPath, JSON.stringify({
+      files: ['crlf.html'],
+      insertAfter: '<head>',
+      commentSyntax: 'html',
+    }));
+
+    runInject(tmp, cfgPath, ['--port', '8400']);
+    const afterInject = readFileSync(file, 'utf-8');
+
+    assert.ok(
+      afterInject.includes(
+        '<head>\r\n<!-- impeccable-live-start -->\r\n<script src="http://localhost:8400/live.js"></script>\r\n<!-- impeccable-live-end -->\r\n  <title>X</title>'
+      ),
+      `CRLF insertAfter should keep CRLF boundaries around the injected block, got:\n${JSON.stringify(afterInject)}`
+    );
+
+    runInject(tmp, cfgPath, ['--remove']);
+    const afterRemove = readFileSync(file, 'utf-8');
+    assert.equal(afterRemove, original, 'CRLF file should round-trip cleanly after remove');
   });
 });

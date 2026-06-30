@@ -12,16 +12,16 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { cpSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { isGeneratedFile } from '../source/skills/impeccable/scripts/is-generated.mjs';
-import { detectCsp } from '../source/skills/impeccable/scripts/detect-csp.mjs';
+import { isGeneratedFile } from '../skill/scripts/lib/is-generated.mjs';
+import { detectCsp } from '../skill/scripts/detect-csp.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const SCRIPTS_DIR = join(__dirname, '..', 'source', 'skills', 'impeccable', 'scripts');
+const SCRIPTS_DIR = join(__dirname, '..', 'skill', 'scripts');
 const FIXTURES_DIR = join(__dirname, 'framework-fixtures');
 
 function listFixtures() {
@@ -43,7 +43,8 @@ function stageFixture(name) {
   const tmp = mkdtempSync(join(tmpdir(), 'impeccable-fixture-'));
   cpSync(join(fixtureRoot, 'files'), tmp, { recursive: true });
   writeFileSync(join(tmp, '.gitignore'), gitignore);
-  writeFileSync(join(tmp, 'impeccable-live.config.json'), JSON.stringify(fixture.config));
+  mkdirSync(join(tmp, '.impeccable', 'live'), { recursive: true });
+  writeFileSync(join(tmp, '.impeccable', 'live', 'config.json'), JSON.stringify(fixture.config));
 
   execFileSync('git', ['init', '-q'], { cwd: tmp });
   execFileSync('git', ['config', 'user.email', 'test@example.com'], { cwd: tmp });
@@ -109,13 +110,38 @@ for (const name of listFixtures()) {
     it('live-inject --port adds the script tag to every config file', () => {
       const { tmp } = stageFixture(name);
       try {
-        const configPath = join(tmp, 'impeccable-live.config.json');
-        const out = runScript('live-inject.mjs', ['--port', '9999'], {
-          cwd: tmp,
-          env: { IMPECCABLE_LIVE_CONFIG: configPath },
-        });
+        const out = runScript('live-inject.mjs', ['--port', '9999'], { cwd: tmp });
         const result = JSON.parse(typeof out === 'string' ? out : out.error);
         assert.equal(result.ok, true, 'inject succeeded');
+        assert.equal(result.gitIgnore?.mode, 'git-info-exclude', 'live runtime ignores are installed locally');
+        const ignored = execFileSync('git', [
+          'check-ignore',
+          '.impeccable/live/server.json',
+          '.impeccable/live/sessions/example.jsonl',
+          '.impeccable/live/previews/example/v1.html',
+          '.impeccable/live/deferred-svelte-component-accepts.json',
+          'src/lib/impeccable/ImpeccableLiveRoot.svelte',
+          'src/lib/impeccable/__runtime.js',
+          'src/lib/impeccable/a4ac4e74/v3.svelte',
+        ], { cwd: tmp, encoding: 'utf-8' });
+        assert.match(ignored, /\.impeccable\/live\/server\.json/);
+        assert.match(ignored, /\.impeccable\/live\/sessions\/example\.jsonl/);
+        assert.match(ignored, /\.impeccable\/live\/previews\/example\/v1\.html/);
+        assert.match(ignored, /\.impeccable\/live\/deferred-svelte-component-accepts\.json/);
+        assert.match(ignored, /src\/lib\/impeccable\/ImpeccableLiveRoot\.svelte/);
+        assert.match(ignored, /src\/lib\/impeccable\/__runtime\.js/);
+        assert.match(ignored, /src\/lib\/impeccable\/a4ac4e74\/v3\.svelte/);
+        if (result.adapter === 'sveltekit') {
+          const layout = readFileSync(join(tmp, 'src/routes/+layout.svelte'), 'utf-8');
+          const appHtml = readFileSync(join(tmp, 'src/app.html'), 'utf-8');
+          const root = readFileSync(join(tmp, 'src/lib/impeccable/ImpeccableLiveRoot.svelte'), 'utf-8');
+          assert.match(layout, /impeccable-live-svelte-start/, 'SvelteKit layout got the adapter marker');
+          assert.match(layout, /ImpeccableLiveRoot/, 'SvelteKit layout renders the adapter host');
+          assert.doesNotMatch(appHtml, /impeccable-live-start/, 'SvelteKit app.html must remain untouched');
+          assert.doesNotMatch(appHtml, /localhost:9999\/live\.js/, 'SvelteKit app.html must not own live.js');
+          assert.match(root, /localhost:9999\/live\.js/, 'SvelteKit root component loads live.js');
+          return;
+        }
         for (const r of result.results) {
           assert.ok(r.inserted, `${r.file} got the tag (result: ${JSON.stringify(r)})`);
           const body = readFileSync(join(tmp, r.file), 'utf-8');
@@ -130,17 +156,19 @@ for (const name of listFixtures()) {
     it('live-inject --remove strips the script tag cleanly', () => {
       const { tmp } = stageFixture(name);
       try {
-        const configPath = join(tmp, 'impeccable-live.config.json');
-        runScript('live-inject.mjs', ['--port', '9999'], {
-          cwd: tmp,
-          env: { IMPECCABLE_LIVE_CONFIG: configPath },
-        });
-        const out = runScript('live-inject.mjs', ['--remove'], {
-          cwd: tmp,
-          env: { IMPECCABLE_LIVE_CONFIG: configPath },
-        });
+        runScript('live-inject.mjs', ['--port', '9999'], { cwd: tmp });
+        const out = runScript('live-inject.mjs', ['--remove'], { cwd: tmp });
         const result = JSON.parse(typeof out === 'string' ? out : out.error);
         assert.equal(result.ok, true, 'remove succeeded');
+        if (result.adapter === 'sveltekit') {
+          const layout = readFileSync(join(tmp, 'src/routes/+layout.svelte'), 'utf-8');
+          const appHtml = readFileSync(join(tmp, 'src/app.html'), 'utf-8');
+          assert.doesNotMatch(layout, /ImpeccableLiveRoot/);
+          assert.doesNotMatch(layout, /impeccable-live-svelte-start/);
+          assert.doesNotMatch(appHtml, /impeccable-live-start/);
+          assert.equal(existsSync(join(tmp, 'src/lib/impeccable/ImpeccableLiveRoot.svelte')), false);
+          return;
+        }
         for (const r of result.results) {
           const body = readFileSync(join(tmp, r.file), 'utf-8');
           assert.doesNotMatch(body, /impeccable-live-start/);
@@ -184,6 +212,12 @@ for (const name of listFixtures()) {
             assert.equal(parsed.error, wc.expectsError, `wrap case "${wc.name}": expected error ${wc.expectsError}, got ${JSON.stringify(parsed)}`);
           } else {
             assert.equal(parsed.file, wc.expectedFile, `wrap case "${wc.name}": landed in ${parsed.file}, expected ${wc.expectedFile}`);
+            if (wc.expectedSourceFile) {
+              assert.equal(parsed.sourceFile, wc.expectedSourceFile, `wrap case "${wc.name}": source file`);
+            }
+            if (wc.expectedPreviewMode) {
+              assert.equal(parsed.previewMode, wc.expectedPreviewMode, `wrap case "${wc.name}": preview mode`);
+            }
           }
         }
       } finally {

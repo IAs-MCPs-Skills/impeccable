@@ -1,12 +1,12 @@
 # ADR: Live Variant Mode
 
-**Status:** Implemented (v3.1, feature branch `feature/single-skill-consolidation`)
+**Status:** Implemented
 **Date:** 2026-04-12
 **Author:** Paul Bakaus + Claude
 
 ## Context
 
-Impeccable is a design skill for AI coding agents. It teaches AI harnesses (Claude Code, Cursor, Gemini CLI, Codex, etc.) how to produce better frontend design. The skill has 22 commands (bolder, quieter, polish, typeset, etc.) that the agent runs on source code.
+Impeccable is a design skill for AI coding agents. It teaches AI harnesses (Claude Code, Cursor, Gemini CLI, Codex, etc.) how to produce better frontend design. The skill has 23 commands (bolder, quieter, polish, typeset, etc.) that the agent runs on source code.
 
 The missing piece: there was no way to visually iterate on a live page. The user could ask the agent to "make this bolder," but they had to read the code diff, reload the page, and decide if they liked it. If not, they'd ask again, wait, reload, repeat. Slow and disconnected.
 
@@ -28,7 +28,7 @@ Variants are written to the actual source file, not injected into the browser DO
 Server-Sent Events (server to browser) + fetch POST (browser to server) instead of WebSocket. This eliminates the `ws` npm dependency entirely. The server is zero-dependency pure Node.js (http, crypto, fs, net, os). This matters because the scripts ship inside the skill directory and run in the user's project without any package installation.
 
 **3. Self-contained skill scripts.**
-All live mode code lives in `source/skills/impeccable/scripts/`:
+All live mode code lives in `skill/scripts/`:
 - `live-server.mjs` — HTTP server (SSE, poll, source file reader)
 - `live-poll.mjs` — CLI client for the agent poll/reply loop
 - `live-wrap.mjs` — CLI helper that finds elements in source and creates variant wrappers
@@ -82,7 +82,7 @@ For dev servers that don't support HMR (like Bun's static HTML import), the brow
  │  └── GET  /stop        — graceful shutdown                      │
  │                                                                 │
  │  State: session token, SSE client set, event queue, poll queue  │
- │  PID file: .impeccable-live.json (project root)                 │
+ │  Server file: .impeccable/live/server.json (project root)        │
  │                                                                 │
  └────────────┬──────────────────────────────────┬─────────────────┘
               │ GET /poll (long-poll)             │ POST /poll (reply)
@@ -91,7 +91,7 @@ For dev servers that don't support HMR (like Bun's static HTML import), the brow
  ┌─────────────────────────────────────────────────────────────────┐
  │                         AGENT                                   │
  │                                                                 │
- │  Follows source/skills/impeccable/reference/live.md             │
+ │  Follows skill/reference/live.md             │
  │  1. Start server: node scripts_path/live-server.mjs &           │
  │  2. Inject <script> into source HTML (comment-marked)           │
  │  3. Poll loop:                                                  │
@@ -228,7 +228,7 @@ This survives page reloads, browser close/reopen, HMR, and accidental refreshes.
 
 - **Session token**: `crypto.randomUUID()`, checked on all mutating endpoints and SSE connections.
 - **Localhost only**: server binds to `127.0.0.1`, not `0.0.0.0`.
-- **Token in PID file**: `.impeccable-live.json` in project root. Only the user's processes can read it.
+- **Token in server file**: `.impeccable/live/server.json` in project root. Only the user's processes can read it.
 - **Token injected into `/live.js`**: the server prepends `window.__IMPECCABLE_TOKEN__` at serve time.
 - **Path traversal guard**: `/source` endpoint validates the requested path is within `process.cwd()`.
 - **No eval/innerHTML**: all browser UI built with `createElement` and `textContent`.
@@ -258,12 +258,4 @@ Net effect: 4 tool calls (wrap + edit + read + reply) instead of 8+.
 
 - **Bun's static HTML import**: Bun's `import from "index.html"` caches at module load time. Source changes require a server restart to appear in the served HTML. The no-HMR fallback (fetch from `/source`) handles this, but it's less seamless than Vite/Next.js where HMR works natively.
 - **Single generation at a time**: only one generate/cycle session can be active. This is by design (the source file can only have one variant wrapper at a time).
-- **Inspection-only accept (v1)**: accepting a variant presents the code to the user and cleans up the scaffolding. Write-back (keeping the variant in place) is planned for v2.
 - **No cancel during generation**: once the agent starts generating, it finishes all variants before the user can interact again.
-
-## Future work
-
-- **Write-back on accept**: instead of restoring the original after accept, keep the accepted variant as the new source.
-- **Detect-to-fix flow**: clicking a detected anti-pattern pre-selects that element and pre-fills the action (e.g., "overused font" pre-fills "typeset").
-- **Background poll for Claude Code**: use `run_in_background: true` to keep the main conversation free during the poll loop.
-- **Streaming variants**: progressive reveal as the agent writes each variant (currently batched for speed).

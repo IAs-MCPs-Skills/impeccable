@@ -1,17 +1,52 @@
 import { describe, test, expect } from 'bun:test';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import { spawnSync } from 'child_process';
 import {
   ANTIPATTERNS, checkElementBorders, checkElementMotion, checkElementGlow, isNeutralColor, isFullPage,
-  detectText, extractStyleBlocks, extractCSSinJS,
+  detectText, detectHtml, extractStyleBlocks, extractCSSinJS,
   walkDir, SCANNABLE_EXTENSIONS,
   buildImportGraph, resolveImport,
   detectFrameworkConfig, isPortListening, FRAMEWORK_CONFIGS,
-} from '../src/detect-antipatterns.mjs';
+} from '../cli/engine/detect-antipatterns.mjs';
+import {
+  checkElementTextOverflowDOM,
+  isScreenReaderOnlyTextStyle,
+} from '../cli/engine/rules/checks.mjs';
 
 const FIXTURES = path.join(import.meta.dir, 'fixtures', 'antipatterns');
-const SCRIPT = path.join(import.meta.dir, '..', 'src', 'detect-antipatterns.mjs');
+const SCRIPT = path.join(import.meta.dir, '..', 'cli', 'engine', 'detect-antipatterns.mjs');
+const BENCH_SCRIPT = path.join(import.meta.dir, '..', 'scripts', 'benchmark-detector.mjs');
+
+function withoutDesignSystemArgs(args) {
+  return args[0] === 'detect'
+    ? ['detect', '--no-design-system', '--no-config', ...args.slice(1)]
+    : ['--no-design-system', '--no-config', ...args];
+}
+
+function writeStaticFixture(files) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'impeccable-static-'));
+  for (const [name, contents] of Object.entries(files)) {
+    const fullPath = path.join(dir, name);
+    fs.mkdirSync(path.dirname(fullPath), { recursive: true });
+    fs.writeFileSync(fullPath, contents);
+  }
+  return { dir, file: path.join(dir, 'index.html') };
+}
+
+async function withStaticFixture(files, callback) {
+  const fixture = writeStaticFixture(files);
+  try {
+    return await callback(fixture);
+  } finally {
+    fs.rmSync(fixture.dir, { recursive: true, force: true });
+  }
+}
+
+function findingIds(findings) {
+  return findings.map(f => f.antipattern);
+}
 
 
 // ---------------------------------------------------------------------------
@@ -101,9 +136,14 @@ describe('detectText — Tailwind side-tab', () => {
     expect(f.some(r => r.antipattern === 'side-tab')).toBe(true);
   });
 
-  test('detects border-l-1 + rounded', () => {
-    const f = detectText('<div class="border-l-1 border-blue-500 rounded-md">', 'test.html');
+  test('detects border-l-2 + rounded', () => {
+    const f = detectText('<div class="border-l-2 border-blue-500 rounded-md">', 'test.html');
     expect(f.some(r => r.antipattern === 'side-tab')).toBe(true);
+  });
+
+  test('ignores border-l-1 + rounded', () => {
+    const f = detectText('<div class="border-l-1 border-blue-500 rounded-md">', 'test.html');
+    expect(f.filter(r => r.antipattern === 'side-tab')).toHaveLength(0);
   });
 
   test('ignores border-l-1 without rounded', () => {
@@ -120,6 +160,11 @@ describe('detectText — Tailwind side-tab', () => {
 describe('detectText — CSS borders', () => {
   test('detects border-left shorthand', () => {
     const f = detectText('.card { border-left: 4px solid #3b82f6; }', 'test.css');
+    expect(f.some(r => r.antipattern === 'side-tab')).toBe(true);
+  });
+
+  test('detects border-left shorthand in Sass', () => {
+    const f = detectText(".card\n  border-left: 4px solid #3b82f6", 'test.sass');
     expect(f.some(r => r.antipattern === 'side-tab')).toBe(true);
   });
 
@@ -170,7 +215,7 @@ describe('detectText — flat type hierarchy', () => {
   });
 });
 
-// jsdom fixture tests moved to detect-antipatterns-fixtures.test.mjs (run via node --test)
+// Static HTML/CSS fixture tests moved to detect-antipatterns-fixtures.test.mjs (run via node --test)
 
 // ---------------------------------------------------------------------------
 // Full page vs partial detection
@@ -213,6 +258,32 @@ describe('partials skip page-level checks', () => {
   });
 });
 
+describe('detectText — numbered section markers', () => {
+  test('flags visible full-page numbered section labels', () => {
+    const page = '<!DOCTYPE html><html><body>' +
+      '<section><span>01</span><h2>Strategy</h2></section>' +
+      '<section><span>02</span><h2>Prototype</h2></section>' +
+      '<section><span>03</span><h2>Launch</h2></section>' +
+      '</body></html>';
+    const f = detectText(page, 'test.html');
+    expect(f.some(r => r.antipattern === 'numbered-section-markers')).toBe(true);
+  });
+
+  test('does not run page-level numbered marker analysis on JS source with embedded HTML strings', () => {
+    const source = `
+      const shell = '<!DOCTYPE html><html><head><title>Preview</title></head><body></body></html>';
+      const palette = 'oklch(86% 0.07 84 / 0.08)';
+      const shadow = '0 0 0 1px oklch(0% 0 0 / 0.04), 0 4px 16px oklch(0% 0 0 / 0.05), 0 1px 3px oklch(0% 0 0 / 0.06)';
+      const size = '11.5px';
+      const eye = '<svg viewBox="0 0 24 24"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/></svg>';
+      const shader = 'float band = bandAt(uv.y - y, 0.05, 0.32);';
+      const luminance = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255;
+    `;
+    const f = detectText(source, 'live-browser.js');
+    expect(f.filter(r => r.antipattern === 'numbered-section-markers')).toHaveLength(0);
+  });
+});
+
 // ---------------------------------------------------------------------------
 // Layout anti-patterns
 // ---------------------------------------------------------------------------
@@ -227,20 +298,151 @@ describe('detectHtml — layout', () => {
     expect(f.some(r => r.antipattern === 'monotonous-spacing')).toBe(true);
   });
 
-  test('detects everything centered via regex', () => {
-    const html = `<!DOCTYPE html><html><body>
-<h1 style="text-align: center;">Title</h1>
-<p style="text-align: center;">Paragraph one more text here</p>
-<p style="text-align: center;">Paragraph two more text here</p>
-<p style="text-align: center;">Paragraph three more text here</p>
-<p style="text-align: center;">Paragraph four more text here</p>
-<p style="text-align: center;">Paragraph five more text here</p>
-<p style="text-align: center;">Paragraph six more text here</p>
-</body></html>`;
-    const f = detectText(html, 'test.html');
-    expect(f.some(r => r.antipattern === 'everything-centered')).toBe(true);
+});
+
+// ---------------------------------------------------------------------------
+// Text overflow screen-reader-only handling
+// ---------------------------------------------------------------------------
+
+describe('checkElementTextOverflowDOM', () => {
+  function baseTextStyle(overrides = {}) {
+    return {
+      position: 'static',
+      width: '160px',
+      height: '20px',
+      overflow: 'visible',
+      overflowX: 'visible',
+      overflowY: 'visible',
+      clipPath: 'none',
+      clip: 'auto',
+      ...overrides,
+    };
+  }
+
+  function mockTextElement({
+    className = 'flag-overflow',
+    style = baseTextStyle(),
+    clientWidth = 24,
+    clientHeight = 20,
+    scrollWidth = 80,
+    rectWidth = clientWidth,
+    rectHeight = clientHeight,
+  } = {}) {
+    return {
+      tagName: 'DIV',
+      className,
+      childNodes: [{ nodeType: 3, textContent: 'A long accessible label that overflows its box' }],
+      parentElement: null,
+      clientWidth,
+      clientHeight,
+      scrollWidth,
+      __style: style,
+      getAttribute(name) {
+        return name === 'class' ? className : null;
+      },
+      getBoundingClientRect() {
+        return { width: rectWidth, height: rectHeight };
+      },
+    };
+  }
+
+  function withMockComputedStyle(callback) {
+    const original = globalThis.getComputedStyle;
+    globalThis.getComputedStyle = (el) => el.__style;
+    try {
+      return callback();
+    } finally {
+      if (original === undefined) delete globalThis.getComputedStyle;
+      else globalThis.getComputedStyle = original;
+    }
+  }
+
+  test('classifies clip-path sr-only text as visually hidden', () => {
+    expect(isScreenReaderOnlyTextStyle(baseTextStyle({
+      position: 'absolute',
+      width: '1px',
+      height: '1px',
+      overflow: 'hidden',
+      overflowX: 'hidden',
+      overflowY: 'hidden',
+      clipPath: 'inset(50%)',
+    }), { width: 1, height: 1 })).toBe(true);
   });
 
+  test('classifies legacy clip rect sr-only text as visually hidden', () => {
+    expect(isScreenReaderOnlyTextStyle(baseTextStyle({
+      position: 'absolute',
+      width: '1px',
+      height: '1px',
+      overflow: 'hidden',
+      overflowX: 'hidden',
+      overflowY: 'hidden',
+      clip: 'rect(0, 0, 0, 0)',
+    }), { width: 1, height: 1 })).toBe(true);
+  });
+
+  test('classifies tiny absolute overflow-hidden text as visually hidden without clip', () => {
+    expect(isScreenReaderOnlyTextStyle(baseTextStyle({
+      position: 'absolute',
+      width: '1px',
+      height: '1px',
+      overflow: 'hidden',
+      overflowX: 'hidden',
+      overflowY: 'hidden',
+    }), { width: 1, height: 1 })).toBe(true);
+  });
+
+  test('classifies fully clipped text as visually hidden without tiny sizing', () => {
+    expect(isScreenReaderOnlyTextStyle(baseTextStyle({
+      position: 'absolute',
+      width: '160px',
+      height: '20px',
+      overflow: 'visible',
+      clipPath: 'inset(50%)',
+    }), { width: 160, height: 20 })).toBe(true);
+  });
+
+  test('flags visible overflowing text', () => {
+    const findings = withMockComputedStyle(() => checkElementTextOverflowDOM(mockTextElement()));
+
+    expect(findings).toHaveLength(1);
+    expect(findings[0].id).toBe('text-overflow');
+    expect(findings[0].snippet).toContain('.flag-overflow');
+  });
+
+  test('skips overflowing sr-only text', () => {
+    const srOnly = mockTextElement({
+      className: 'pass-sr-only-clip-path',
+      style: baseTextStyle({
+        position: 'absolute',
+        width: '1px',
+        height: '1px',
+        overflow: 'hidden',
+        overflowX: 'hidden',
+        overflowY: 'hidden',
+        clipPath: 'inset(50%)',
+      }),
+      clientWidth: 1,
+      clientHeight: 1,
+      scrollWidth: 240,
+      rectWidth: 1,
+      rectHeight: 1,
+    });
+
+    const findings = withMockComputedStyle(() => checkElementTextOverflowDOM(srOnly));
+
+    expect(findings).toHaveLength(0);
+  });
+
+  test('does not classify tiny visible text as sr-only', () => {
+    const style = baseTextStyle({
+      position: 'absolute',
+      width: '1px',
+      height: '1px',
+    });
+
+    expect(isScreenReaderOnlyTextStyle(style, { width: 1, height: 1 })).toBe(false);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -350,8 +552,10 @@ describe('detectText — motion', () => {
   });
 
   test('detects animation: bounce CSS', () => {
-    const f = detectText('.icon { animation: bounce 1s infinite; }', 'test.css');
-    expect(f.some(r => r.antipattern === 'bounce-easing')).toBe(true);
+    const f = detectText('.icon { animation: bounce-ball 1s infinite; }', 'test.css');
+    const finding = f.find(r => r.antipattern === 'bounce-easing');
+    expect(finding).toBeTruthy();
+    expect(finding.snippet).toBe('animation: bounce-ball');
   });
 
   test('detects animation-name: elastic', () => {
@@ -508,6 +712,116 @@ describe('detectText — dark glow', () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// Static HTML/CSS engine
+// ---------------------------------------------------------------------------
+
+describe('detectHtml — static HTML/CSS engine', () => {
+  test('inlines local linked stylesheets', async () => {
+    const f = await detectHtml(path.join(FIXTURES, 'linked-stylesheet.html'));
+    expect(findingIds(f)).toContain('side-tab');
+  });
+
+  test('flattens @layer, resolves CSS variables and fallbacks, and skips unsupported selectors', async () => {
+    await withStaticFixture({
+      'index.html': `<!DOCTYPE html>
+        <html>
+          <head>
+            <style>
+              @layer components {
+                :root { --accent: #3b82f6; --fallback-accent: var(--missing-accent, #a855f7); }
+                .layer-side { border-left: 5px solid var(--accent); border-radius: 8px; }
+                .layer-top { border-top: 4px solid var(--fallback-accent); border-radius: 8px; }
+                .ignored:future-only(foo) { border-left: 20px solid #ef4444; }
+              }
+            </style>
+          </head>
+          <body>
+            <div class="layer-side">Layer variable side tab</div>
+            <div class="layer-top">Fallback variable top accent</div>
+          </body>
+        </html>`,
+    }, async ({ file }) => {
+      const profile = [];
+      const f = await detectHtml(file, { profile });
+      const ids = findingIds(f);
+      expect(ids).toContain('side-tab');
+      expect(ids).toContain('border-accent-on-rounded');
+      expect(profile.some(e => e.engine === 'static-html' && e.ruleId === 'unsupported-selector')).toBe(true);
+    });
+  });
+
+  test('honors specificity, source order, !important, and inline style precedence', async () => {
+    await withStaticFixture({
+      'index.html': `<!DOCTYPE html>
+        <html>
+          <head>
+            <style>
+              .specificity-pass { border-left: 5px solid #3b82f6; border-radius: 8px; }
+              div.specificity-pass { border-left-color: #d1d5db; }
+              .source-order-flag { border-left: 5px solid #d1d5db; border-radius: 8px; }
+              .source-order-flag { border-left-color: #ef4444; }
+              .important-pass { border-left: 5px solid #d1d5db !important; border-radius: 8px; }
+              .important-pass { border-left-color: #3b82f6; }
+            </style>
+          </head>
+          <body>
+            <div class="specificity-pass">Specificity neutral pass</div>
+            <div class="source-order-flag">Source order chromatic flag</div>
+            <div class="important-pass">Important neutral pass</div>
+            <div style="border-left: 5px solid #06b6d4; border-radius: 8px;">Inline chromatic flag</div>
+          </body>
+        </html>`,
+    }, async ({ file }) => {
+      const f = await detectHtml(file);
+      expect(findingIds(f).filter(id => id === 'side-tab')).toHaveLength(2);
+    });
+  });
+
+  test('expands background, border, font, transition, and animation shorthands', async () => {
+    await withStaticFixture({
+      'index.html': `<!DOCTYPE html>
+        <html>
+          <head>
+            <style>
+              .font-short {
+                font: italic 700 11px/1.05 Arial, sans-serif;
+              }
+              .background-short {
+                background: #000;
+                color: #111;
+                font-size: 16px;
+              }
+              .border-short {
+                border: 1px solid #d1d5db;
+                border-left: 5px solid #3b82f6;
+                border-radius: 8px;
+              }
+              .motion-short {
+                transition: width 250ms cubic-bezier(.68,-.55,.27,1.55);
+                animation: bounce 1s cubic-bezier(.68,-.55,.27,1.55) infinite;
+              }
+            </style>
+          </head>
+          <body>
+            <p class="font-short">This tiny paragraph is long enough to trigger both the static font shorthand size and line-height checks.</p>
+            <button class="background-short">Low contrast button text</button>
+            <div class="border-short">Border shorthand side tab</div>
+            <div class="motion-short">Motion shorthand easing</div>
+          </body>
+        </html>`,
+    }, async ({ file }) => {
+      const ids = findingIds(await detectHtml(file));
+      expect(ids).toContain('tiny-text');
+      expect(ids).toContain('tight-leading');
+      expect(ids).toContain('low-contrast');
+      expect(ids).toContain('side-tab');
+      expect(ids).toContain('bounce-easing');
+      expect(ids).toContain('layout-transition');
+    });
+  });
+});
+
 
 // ---------------------------------------------------------------------------
 // ANTIPATTERNS registry
@@ -532,6 +846,10 @@ describe('ANTIPATTERNS registry', () => {
 // ---------------------------------------------------------------------------
 
 describe('walkDir', () => {
+  test('includes Sass files in scannable extensions', () => {
+    expect(SCANNABLE_EXTENSIONS.has('.sass')).toBe(true);
+  });
+
   test('finds scannable files', () => {
     const files = walkDir(FIXTURES);
     expect(files.length).toBeGreaterThanOrEqual(3);
@@ -549,7 +867,11 @@ describe('walkDir', () => {
 
 describe('CLI', () => {
   function run(...args) {
-    const result = spawnSync('node', [SCRIPT, ...args], { encoding: 'utf-8', timeout: 15000 });
+    const result = spawnSync('node', [SCRIPT, ...withoutDesignSystemArgs(args)], { encoding: 'utf-8', timeout: 15000 });
+    return { stdout: result.stdout || '', stderr: result.stderr || '', code: result.status };
+  }
+  function runIn(cwd, ...args) {
+    const result = spawnSync('node', [SCRIPT, ...args], { cwd, encoding: 'utf-8', timeout: 15000 });
     return { stdout: result.stdout || '', stderr: result.stderr || '', code: result.status };
   }
 
@@ -557,6 +879,13 @@ describe('CLI', () => {
     const { stdout, code } = run('--help');
     expect(code).toBe(0);
     expect(stdout).toContain('Usage:');
+    expect(stdout).toContain('--quiet');
+  });
+
+  test('detect subcommand is not treated as a scan target', () => {
+    const { stderr, code } = run('detect', '--json', path.join(FIXTURES, 'should-pass.html'));
+    expect(code).toBe(0);
+    expect(stderr).not.toContain('cannot access detect');
   });
 
   test('should-pass exits 0', () => {
@@ -571,9 +900,44 @@ describe('CLI', () => {
   });
 
   test('--json outputs valid JSON', () => {
-    const { stderr, code } = run('--json', path.join(FIXTURES, 'should-flag.html'));
+    const { stdout, code } = run('--json', path.join(FIXTURES, 'should-flag.html'));
     expect(code).toBe(2);
-    const parsed = JSON.parse(stderr.trim());
+    const parsed = JSON.parse(stdout.trim());
+    expect(parsed).toBeArray();
+    expect(parsed.length).toBeGreaterThan(0);
+  });
+
+  test('--quiet suppresses text details and keeps the summary exit signal', () => {
+    const { stdout, stderr, code } = run('--quiet', path.join(FIXTURES, 'should-flag.html'));
+    expect(code).toBe(2);
+    expect(stdout).toBe('');
+    expect(stderr.trim()).toMatch(/^[1-9]\d* anti-patterns? found\.$/);
+    expect(stderr).not.toContain('side-tab');
+    expect(stderr).not.toContain('line ');
+  });
+
+  test('--quiet stays silent on clean files', () => {
+    const { stdout, stderr, code } = run('--quiet', path.join(FIXTURES, 'should-pass.html'));
+    expect(code).toBe(0);
+    expect(stdout).toBe('');
+    expect(stderr).toBe('');
+  });
+
+  test('--quiet does not affect JSON output', () => {
+    const { stdout, stderr, code } = run('--json', '--quiet', path.join(FIXTURES, 'should-flag.html'));
+    expect(code).toBe(2);
+    expect(stderr).toBe('');
+    const parsed = JSON.parse(stdout.trim());
+    expect(parsed).toBeArray();
+    expect(parsed.length).toBeGreaterThan(0);
+    expect(parsed.some(f => f.antipattern === 'side-tab')).toBe(true);
+  });
+
+  test('-json alias outputs valid JSON', () => {
+    const { stdout, stderr, code } = run('-json', path.join(FIXTURES, 'should-flag.html'));
+    expect(code).toBe(2);
+    expect(stderr).not.toContain('cannot access -json');
+    const parsed = JSON.parse(stdout.trim());
     expect(parsed).toBeArray();
     expect(parsed.length).toBeGreaterThan(0);
   });
@@ -584,20 +948,197 @@ describe('CLI', () => {
     expect(JSON.parse(stdout.trim())).toEqual([]);
   });
 
-  test('--fast mode works', () => {
-    const { code } = run('--fast', path.join(FIXTURES, 'should-flag.html'));
-    expect(code).toBe(2);
+  test('--fast is accepted but deprecated (no-op, full scan still runs)', () => {
+    const { code, stderr } = run('--fast', path.join(FIXTURES, 'should-flag.html'));
+    expect(code).toBe(2); // still flags the planted anti-patterns via the full scan
+    expect(stderr).toContain('--fast is deprecated');
   });
 
-  test('linked stylesheet detected (jsdom default)', () => {
+  test('linked stylesheet detected (static HTML/CSS default)', () => {
     const { code, stderr } = run(path.join(FIXTURES, 'linked-stylesheet.html'));
     expect(code).toBe(2);
     expect(stderr).toContain('side-tab');
   });
 
+  test('local DESIGN.md enables design-system rules by default and --no-design-system disables them', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'impeccable-cli-design-system-'));
+    try {
+      fs.writeFileSync(path.join(dir, 'DESIGN.md'), `---
+typography:
+  body:
+    fontFamily: "IBM Plex Sans, Arial, sans-serif"
+colors:
+  ink: "#241f1a"
+  paper: "#f7f4ee"
+rounded:
+  md: "8px"
+---
+
+# Design System
+`);
+      fs.writeFileSync(path.join(dir, 'index.html'), `
+        <section style="font-family: 'Poppins', sans-serif; color: #ff00aa; background: #f7f4ee; border-radius: 18px;">
+          Design drift
+        </section>
+      `);
+
+      const active = runIn(dir, '--json', 'index.html');
+      expect(active.code).toBe(2);
+      const activeIds = JSON.parse(active.stdout).map((finding) => finding.antipattern);
+      expect(activeIds).toContain('design-system-font');
+      expect(activeIds).toContain('design-system-color');
+      expect(activeIds).toContain('design-system-radius');
+
+      const disabled = runIn(dir, '--json', '--no-design-system', 'index.html');
+      const disabledIds = JSON.parse(disabled.stdout).map((finding) => finding.antipattern);
+      expect(disabledIds.some((id) => id.startsWith('design-system-'))).toBe(false);
+
+      const raw = runIn(dir, '--json', '--no-config', 'index.html');
+      const rawIds = JSON.parse(raw.stdout).map((finding) => finding.antipattern);
+      expect(rawIds.some((id) => id.startsWith('design-system-'))).toBe(false);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('detector designSystem.enabled=false disables CLI design-system rules', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'impeccable-cli-design-disabled-'));
+    try {
+      fs.mkdirSync(path.join(dir, '.impeccable'), { recursive: true });
+      fs.writeFileSync(path.join(dir, '.impeccable', 'config.json'), JSON.stringify({
+        detector: { designSystem: { enabled: false } },
+      }));
+      fs.writeFileSync(path.join(dir, 'DESIGN.md'), `---
+typography:
+  body:
+    fontFamily: "IBM Plex Sans, Arial, sans-serif"
+colors:
+  ink: "#241f1a"
+  paper: "#f7f4ee"
+rounded:
+  md: "8px"
+---
+
+# Design System
+`);
+      fs.writeFileSync(path.join(dir, 'index.html'), `
+        <section style="font-family: 'Poppins', sans-serif; color: #ff00aa; background: #f7f4ee; border-radius: 18px;">
+          Design drift
+        </section>
+      `);
+
+      const result = runIn(dir, '--json', 'index.html');
+      const ids = JSON.parse(result.stdout).map((finding) => finding.antipattern);
+      expect(ids.some((id) => id.startsWith('design-system-'))).toBe(false);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('respects .impeccable config ignoreFiles like the hook', async () => {
+    await withStaticFixture({
+      '.impeccable/config.json': JSON.stringify({
+        detector: { ignoreFiles: ['src/noisy.css'] },
+      }),
+      'src/noisy.css': "body { font-family: 'Inter', sans-serif; }",
+    }, ({ dir }) => {
+      const { stdout, code } = runIn(dir, '--json', 'src');
+      expect(code).toBe(0);
+      expect(JSON.parse(stdout.trim())).toEqual([]);
+    });
+  });
+
+  test('respects .impeccable config ignoreRules like the hook', async () => {
+    await withStaticFixture({
+      '.impeccable/config.json': JSON.stringify({
+        detector: { ignoreRules: ['side-tab'] },
+      }),
+      'src/card.css': '.card { border-left: 4px solid #3b82f6; border-radius: 12px; }',
+    }, ({ dir }) => {
+      const { stdout, code } = runIn(dir, '--json', 'src/card.css');
+      expect(code).toBe(0);
+      expect(JSON.parse(stdout.trim())).toEqual([]);
+    });
+  });
+
+  test('respects .impeccable config ignoreValues like the hook', async () => {
+    await withStaticFixture({
+      '.impeccable/config.json': JSON.stringify({
+        detector: {
+          ignoreValues: [
+            { rule: 'overused-font', value: 'Inter' },
+          ],
+        },
+      }),
+      'src/fonts.css': [
+        "body { font-family: 'Inter', sans-serif; }",
+        "h1 { font-family: 'Roboto', sans-serif; }",
+      ].join('\n'),
+    }, ({ dir }) => {
+      const { stdout, code } = runIn(dir, '--json', 'src/fonts.css');
+      expect(code).toBe(2);
+      const snippets = JSON.parse(stdout.trim()).map(f => f.snippet).join('\n');
+      expect(snippets).not.toContain('Inter');
+      expect(snippets).toContain('Roboto');
+    });
+  });
+
+  test('respects scoped wildcard ignoreValues like the hook', async () => {
+    await withStaticFixture({
+      '.impeccable/config.json': JSON.stringify({
+        detector: {
+          ignoreValues: [
+            { rule: 'overused-font', value: '*', files: ['src/main.css'] },
+          ],
+        },
+      }),
+      'src/main.css': "body { font-family: 'Inter', sans-serif; }",
+      'src/other.css': "body { font-family: 'Inter', sans-serif; }",
+    }, ({ dir }) => {
+      const { stdout, code } = runIn(dir, '--json', 'src');
+      expect(code).toBe(2);
+      const findings = JSON.parse(stdout.trim());
+      expect(findings.some(f => f.file.endsWith('src/main.css'))).toBe(false);
+      expect(findings.some(f => f.file.endsWith('src/other.css'))).toBe(true);
+    });
+  });
+
   test('warns on nonexistent path', () => {
     const { stderr } = run('/nonexistent/file/xyz.html');
     expect(stderr).toContain('Warning');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Detector benchmark smoke test
+// ---------------------------------------------------------------------------
+
+describe('benchmark-detector', () => {
+  test('--quick --json emits timing schema', () => {
+    const result = spawnSync('node', [BENCH_SCRIPT, '--quick', '--json'], {
+      encoding: 'utf-8',
+      timeout: 30000,
+    });
+    expect(result.status).toBe(0);
+    const parsed = JSON.parse(result.stdout.trim());
+    expect(parsed.version).toBe(1);
+    expect(parsed.quick).toBe(true);
+    expect(parsed.browser).toBe(false);
+    expect(parsed.cases).toBeArray();
+    expect(parsed.cases.length).toBeGreaterThan(0);
+    expect(parsed.summary).toBeArray();
+    expect(parsed.summary.length).toBeGreaterThan(0);
+
+    const okCase = parsed.cases.find(c => c.status === 'ok');
+    expect(okCase).toBeTruthy();
+    expect(okCase).toHaveProperty('totalMs');
+    expect(okCase).toHaveProperty('findings');
+    expect(okCase.profile).toBeArray();
+
+    const row = parsed.summary[0];
+    for (const key of ['engine', 'phase', 'ruleId', 'target', 'calls', 'totalMs', 'avgMs', 'p50', 'p95', 'findings']) {
+      expect(row).toHaveProperty(key);
+    }
   });
 });
 
@@ -796,12 +1337,6 @@ describe('detectText -- CSS-in-JS', () => {
     expect(f.some(r => r.antipattern === 'gradient-text')).toBe(true);
   });
 
-  test('detects pure-black-white in styled-components', () => {
-    const tsx = "const Dark = styled.section`\n  background-color: #000000;\n`;";
-    const f = detectText(tsx, 'Dark.tsx');
-    expect(f.some(r => r.antipattern === 'pure-black-white')).toBe(true);
-  });
-
   test('does not false-positive on clean CSS-in-JS', () => {
     const tsx = "const Card = styled.div`\n  border-radius: 12px;\n  padding: 24px;\n`;";
     const f = detectText(tsx, 'Card.tsx');
@@ -815,7 +1350,7 @@ describe('detectText -- CSS-in-JS', () => {
 
 describe('CLI -- framework fixtures', () => {
   function run(...args) {
-    const result = spawnSync('node', [SCRIPT, ...args], { encoding: 'utf-8', timeout: 15000 });
+    const result = spawnSync('node', [SCRIPT, ...withoutDesignSystemArgs(args)], { encoding: 'utf-8', timeout: 15000 });
     return { stdout: result.stdout || '', stderr: result.stderr || '', code: result.status };
   }
 
@@ -873,7 +1408,7 @@ describe('CLI -- Next.js + Tailwind project', () => {
   let stderr;
 
   function run(...args) {
-    const result = spawnSync('node', [SCRIPT, ...args], { encoding: 'utf-8', timeout: 15000 });
+    const result = spawnSync('node', [SCRIPT, ...withoutDesignSystemArgs(args)], { encoding: 'utf-8', timeout: 15000 });
     return { stdout: result.stdout || '', stderr: result.stderr || '', code: result.status };
   }
 
@@ -881,7 +1416,7 @@ describe('CLI -- Next.js + Tailwind project', () => {
     const result = run(dir);
     stderr = result.stderr;
     expect(result.code).toBe(2);
-    for (const ap of ['side-tab', 'gradient-text', 'ai-color-palette', 'overused-font', 'bounce-easing', 'pure-black-white']) {
+    for (const ap of ['side-tab', 'gradient-text', 'ai-color-palette', 'overused-font', 'bounce-easing']) {
       expect(stderr).toContain(ap);
     }
   });
@@ -896,10 +1431,8 @@ describe('CLI -- Next.js + Tailwind project', () => {
     expect(stderr).toContain('animate-bounce');
   });
 
-  test('PricingCard: pure-black-white + gradient-text + ai-color-palette', () => {
+  test('PricingCard: gradient-text + ai-color-palette', () => {
     const { stderr } = run(path.join(dir, 'components', 'PricingCard.tsx'));
-    expect(stderr).toContain('pure-black-white');
-    expect(stderr).toContain('bg-black');
     expect(stderr).toContain('gradient-text');
     expect(stderr).toContain('bg-clip-text');
     expect(stderr).toContain('ai-color-palette');
@@ -923,9 +1456,9 @@ describe('CLI -- Next.js + Tailwind project', () => {
   });
 
   test('--json produces clean JSON without framework message', () => {
-    const { stderr, code } = run('--json', dir);
+    const { stdout, code } = run('--json', dir);
     expect(code).toBe(2);
-    const parsed = JSON.parse(stderr.trim());
+    const parsed = JSON.parse(stdout.trim());
     expect(parsed).toBeArray();
     expect(parsed.length).toBeGreaterThanOrEqual(6);
   });
@@ -933,7 +1466,7 @@ describe('CLI -- Next.js + Tailwind project', () => {
 
 describe('CLI -- Next.js + CSS Modules project', () => {
   function run(...args) {
-    const result = spawnSync('node', [SCRIPT, ...args], { encoding: 'utf-8', timeout: 15000 });
+    const result = spawnSync('node', [SCRIPT, ...withoutDesignSystemArgs(args)], { encoding: 'utf-8', timeout: 15000 });
     return { stdout: result.stdout || '', stderr: result.stderr || '', code: result.status };
   }
 
@@ -942,7 +1475,7 @@ describe('CLI -- Next.js + CSS Modules project', () => {
   test('finds all expected anti-pattern types', () => {
     const { code, stderr } = run(dir);
     expect(code).toBe(2);
-    for (const ap of ['side-tab', 'overused-font', 'pure-black-white', 'layout-transition', 'gradient-text']) {
+    for (const ap of ['side-tab', 'overused-font', 'layout-transition', 'gradient-text']) {
       expect(stderr).toContain(ap);
     }
   });
@@ -963,12 +1496,10 @@ describe('CLI -- Next.js + CSS Modules project', () => {
     expect(stderr).toContain('border-right: 3px solid');
   });
 
-  test('globals.css: overused Roboto + pure-black-white', () => {
+  test('globals.css: overused Roboto', () => {
     const { stderr } = run(path.join(dir, 'app', 'globals.css'));
     expect(stderr).toContain('overused-font');
     expect(stderr).toContain('Roboto');
-    expect(stderr).toContain('pure-black-white');
-    expect(stderr).toContain('#000000');
   });
 
   test('page.module.css: gradient-text across lines', () => {
@@ -987,7 +1518,7 @@ describe('CLI -- Next.js + CSS Modules project', () => {
 
 describe('CLI -- Next.js + CSS-in-JS (styled-components) project', () => {
   function run(...args) {
-    const result = spawnSync('node', [SCRIPT, ...args], { encoding: 'utf-8', timeout: 15000 });
+    const result = spawnSync('node', [SCRIPT, ...withoutDesignSystemArgs(args)], { encoding: 'utf-8', timeout: 15000 });
     return { stdout: result.stdout || '', stderr: result.stderr || '', code: result.status };
   }
 
@@ -996,7 +1527,7 @@ describe('CLI -- Next.js + CSS-in-JS (styled-components) project', () => {
   test('finds all expected anti-pattern types', () => {
     const { code, stderr } = run(dir);
     expect(code).toBe(2);
-    for (const ap of ['side-tab', 'gradient-text', 'overused-font', 'bounce-easing', 'pure-black-white', 'layout-transition']) {
+    for (const ap of ['side-tab', 'gradient-text', 'overused-font', 'bounce-easing', 'layout-transition']) {
       expect(stderr).toContain(ap);
     }
   });
@@ -1019,12 +1550,10 @@ describe('CLI -- Next.js + CSS-in-JS (styled-components) project', () => {
     expect(stderr).toContain('Montserrat');
   });
 
-  test('GlobalStyle.tsx: overused Inter + pure-black-white', () => {
+  test('GlobalStyle.tsx: overused Inter', () => {
     const { stderr } = run(path.join(dir, 'components', 'GlobalStyle.tsx'));
     expect(stderr).toContain('overused-font');
     expect(stderr).toContain('Inter');
-    expect(stderr).toContain('pure-black-white');
-    expect(stderr).toContain('#000000');
   });
 
   test('Testimonials.tsx: side-tab + gradient-text in styled blockquote', () => {
@@ -1041,9 +1570,9 @@ describe('CLI -- Next.js + CSS-in-JS (styled-components) project', () => {
   });
 
   test('--json produces clean JSON without framework message', () => {
-    const { stderr, code } = run('--json', dir);
+    const { stdout, code } = run('--json', dir);
     expect(code).toBe(2);
-    const parsed = JSON.parse(stderr.trim());
+    const parsed = JSON.parse(stdout.trim());
     expect(parsed).toBeArray();
     expect(parsed.length).toBeGreaterThanOrEqual(6);
     // Verify importedBy is present in JSON
@@ -1091,6 +1620,16 @@ describe('buildImportGraph', () => {
     expect(themeImports.has(path.join(MF, 'variables.scss'))).toBe(true);
   });
 
+  test('resolves Sass @import', () => {
+    const graph = buildImportGraph([
+      path.join(MF, 'theme.sass'),
+      path.join(MF, 'variables.sass'),
+    ]);
+    const themeImports = graph.get(path.join(MF, 'theme.sass'));
+    expect(themeImports).toBeDefined();
+    expect(themeImports.has(path.join(MF, 'variables.sass'))).toBe(true);
+  });
+
   test('ignores bare/node_modules imports', () => {
     const graph = buildImportGraph([
       path.join(MF, 'App.tsx'),
@@ -1136,7 +1675,7 @@ describe('resolveImport', () => {
 
 describe('CLI -- multi-file scan', () => {
   function run(...args) {
-    const result = spawnSync('node', [SCRIPT, ...args], { encoding: 'utf-8', timeout: 15000 });
+    const result = spawnSync('node', [SCRIPT, ...withoutDesignSystemArgs(args)], { encoding: 'utf-8', timeout: 15000 });
     return { stdout: result.stdout || '', stderr: result.stderr || '', code: result.status };
   }
 
@@ -1147,9 +1686,9 @@ describe('CLI -- multi-file scan', () => {
   });
 
   test('--json multi-file scan includes import context', () => {
-    const { stderr, code } = run('--json', path.join(FIXTURES, 'multifile'));
+    const { stdout, code } = run('--json', path.join(FIXTURES, 'multifile'));
     expect(code).toBe(2);
-    const parsed = JSON.parse(stderr.trim());
+    const parsed = JSON.parse(stdout.trim());
     expect(parsed.length).toBeGreaterThan(0);
     // Findings from Card.tsx should mention being imported by App.tsx
     const cardFindings = parsed.filter(f => f.file?.includes('Card.tsx'));
@@ -1223,7 +1762,7 @@ describe('FRAMEWORK_CONFIGS', () => {
 
 describe('CLI -- dev server suggestion', () => {
   function run(...args) {
-    const result = spawnSync('node', [SCRIPT, ...args], { encoding: 'utf-8', timeout: 15000 });
+    const result = spawnSync('node', [SCRIPT, ...withoutDesignSystemArgs(args)], { encoding: 'utf-8', timeout: 15000 });
     return { stdout: result.stdout || '', stderr: result.stderr || '', code: result.status };
   }
 
@@ -1231,6 +1770,15 @@ describe('CLI -- dev server suggestion', () => {
     const { stderr } = run(path.join(FIXTURES, 'framework-next-tailwind'));
     expect(stderr).toContain('Next.js');
     expect(stderr).toContain('3000');
+  });
+
+  test('--quiet suppresses framework URL scan suggestions', () => {
+    const { stderr, code } = run('--quiet', path.join(FIXTURES, 'framework-next-tailwind'));
+    expect(code).toBe(2);
+    expect(stderr.trim()).toMatch(/^[1-9]\d* anti-patterns? found\.$/);
+    expect(stderr).not.toContain('Next.js');
+    expect(stderr).not.toContain('3000');
+    expect(stderr).not.toContain('Start the dev server');
   });
 
   test('suggests URL scan when Vite config found', () => {

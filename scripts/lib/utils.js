@@ -5,10 +5,22 @@ import path from 'path';
 // belong to the consuming project, not the distributable skill. The build
 // excludes them from dist, and the harness-sync step preserves them across
 // the rm+recopy so local state isn't destroyed on every rebuild.
-// - config.json: live-mode inject target list for the current project.
-//   Written by the agent at first /impeccable live; tied to the project's
-//   filesystem layout. Losing it resets the user's glob + exclusions.
+// - config.json: legacy live-mode inject target list for existing projects.
+//   New installs write project config at .impeccable/live/config.json instead.
 export const PER_PROJECT_SCRIPT_ARTIFACTS = new Set(['config.json']);
+
+const DETECTOR_BUNDLE_DIR = 'cli/engine';
+
+// Detector source files that live OUTSIDE `cli/engine` but are imported by the
+// bundled engine. `cli/engine/cli/main.mjs` imports `../../lib/impeccable-config.mjs`,
+// which in the source CLI resolves to `cli/lib/impeccable-config.mjs`. The detector
+// bundle copies `cli/engine/**` to `scripts/detector/**`, so from the bundled
+// `scripts/detector/cli/main.mjs` that same `../../lib/...` import resolves to
+// `scripts/lib/impeccable-config.mjs`. Copy the dependency there or the bundled
+// detector fails at import time with "Cannot find module .../lib/impeccable-config.mjs".
+const DETECTOR_EXTERNAL_DEPS = [
+  { src: 'cli/lib/impeccable-config.mjs', dest: 'lib/impeccable-config.mjs' },
+];
 
 // Walk the harness-dir skill tree and return any per-project script
 // artifacts found, ready for restoration after a full sync rm+recopy.
@@ -38,6 +50,75 @@ export function restorePerProjectArtifacts(rootDir, stashed) {
     fs.mkdirSync(path.dirname(target), { recursive: true });
     fs.writeFileSync(target, content);
   }
+}
+
+function readDetectorBundleScripts(rootDir) {
+  const detectorDir = path.join(rootDir, DETECTOR_BUNDLE_DIR);
+  if (!fs.existsSync(detectorDir)) return [];
+
+  const scripts = [];
+  const walk = (dir) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const entryPath = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        walk(entryPath);
+        continue;
+      }
+      if (!entry.isFile()) continue;
+      const relPath = path.relative(detectorDir, entryPath).split(path.sep).join('/');
+      scripts.push({
+        name: `detector/${relPath}`,
+        content: fs.readFileSync(entryPath, 'utf-8'),
+        filePath: entryPath,
+        generated: true,
+      });
+    }
+  };
+  walk(detectorDir);
+
+  // Pull in engine dependencies that live outside the bundle dir so the
+  // generated detector is self-contained (see DETECTOR_EXTERNAL_DEPS).
+  for (const { src, dest } of DETECTOR_EXTERNAL_DEPS) {
+    const srcPath = path.join(rootDir, src);
+    if (!fs.existsSync(srcPath)) continue;
+    scripts.push({
+      name: dest,
+      content: fs.readFileSync(srcPath, 'utf-8'),
+      filePath: srcPath,
+      generated: true,
+    });
+  }
+
+  return scripts;
+}
+
+function readSkillScripts(scriptsDir) {
+  const scripts = [];
+
+  const walk = (dir) => {
+    const entries = fs.readdirSync(dir, { withFileTypes: true })
+      .sort((a, b) => a.name.localeCompare(b.name));
+
+    for (const entry of entries) {
+      const entryPath = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        walk(entryPath);
+        continue;
+      }
+      if (!entry.isFile()) continue;
+      if (PER_PROJECT_SCRIPT_ARTIFACTS.has(entry.name)) continue;
+
+      const relPath = path.relative(scriptsDir, entryPath).split(path.sep).join('/');
+      scripts.push({
+        name: relPath,
+        content: fs.readFileSync(entryPath, 'utf-8'),
+        filePath: entryPath,
+      });
+    }
+  };
+
+  walk(scriptsDir);
+  return scripts;
 }
 
 /**
@@ -154,84 +235,102 @@ export function readFilesRecursive(dir, fileList = []) {
 }
 
 /**
- * Read and parse all source files (unified skills architecture)
- * All source lives in source/skills/{name}/SKILL.md
- * Returns { skills } where each skill has userInvocable flag
+ * Read and parse the impeccable skill source.
+ * After v3.0 the repo holds exactly one user-invocable skill, flat at skill/.
+ * Returns { skills: [oneEntry] } so downstream array-shaped consumers stay happy.
+ *
+ * The source manifest is `SKILL.src.md`, NOT `SKILL.md`, on purpose: the
+ * `vercel-labs/skills` CLI discovers a skill by finding a literal `SKILL.md`
+ * and copies that directory verbatim. If `skill/SKILL.md` existed, `npx skills`
+ * would install the UNCOMPILED source (unresolved `{{placeholders}}`, no vendored
+ * detector). Naming it `SKILL.src.md` hides it from discovery so the CLI falls
+ * through to a compiled harness dir (`.agents/skills/impeccable`) instead.
  */
 export function readSourceFiles(rootDir) {
-  const skillsDir = path.join(rootDir, 'source/skills');
-
+  const skillDir = path.join(rootDir, 'skill');
   const skills = [];
 
-  if (fs.existsSync(skillsDir)) {
-    const entries = fs.readdirSync(skillsDir, { withFileTypes: true });
+  const skillMdPath = path.join(skillDir, 'SKILL.src.md');
+  if (!fs.existsSync(skillMdPath)) {
+    return { skills };
+  }
 
-    for (const entry of entries) {
-      const entryPath = path.join(skillsDir, entry.name);
+  const content = fs.readFileSync(skillMdPath, 'utf-8');
+  const { frontmatter, body } = parseFrontmatter(content);
 
-      if (entry.isDirectory()) {
-        // Directory-based skill with potential references
-        const skillMdPath = path.join(entryPath, 'SKILL.md');
-        if (fs.existsSync(skillMdPath)) {
-          const content = fs.readFileSync(skillMdPath, 'utf-8');
-          const { frontmatter, body } = parseFrontmatter(content);
-
-          // Read reference files if they exist
-          const references = [];
-          const referenceDir = path.join(entryPath, 'reference');
-          if (fs.existsSync(referenceDir)) {
-            const refFiles = fs.readdirSync(referenceDir).filter(f => f.endsWith('.md'));
-            for (const refFile of refFiles) {
-              const refPath = path.join(referenceDir, refFile);
-              const refContent = fs.readFileSync(refPath, 'utf-8');
-              references.push({
-                name: path.basename(refFile, '.md'),
-                content: refContent,
-                filePath: refPath
-              });
-            }
-          }
-
-          // Read script files if they exist. PER_PROJECT_SCRIPT_ARTIFACTS
-          // (defined at module top) are excluded from the distributable skill
-          // so the build never bundles one project's state into another's.
-          const scripts = [];
-          const scriptsDir = path.join(entryPath, 'scripts');
-          if (fs.existsSync(scriptsDir)) {
-            const scriptFiles = fs.readdirSync(scriptsDir).filter(f => {
-              if (PER_PROJECT_SCRIPT_ARTIFACTS.has(f)) return false;
-              return fs.statSync(path.join(scriptsDir, f)).isFile();
-            });
-            for (const scriptFile of scriptFiles) {
-              const scriptPath = path.join(scriptsDir, scriptFile);
-              const scriptContent = fs.readFileSync(scriptPath, 'utf-8');
-              scripts.push({
-                name: scriptFile,
-                content: scriptContent,
-                filePath: scriptPath
-              });
-            }
-          }
-
-          skills.push({
-            name: frontmatter.name || entry.name,
-            description: frontmatter.description || '',
-            license: frontmatter.license || '',
-            compatibility: frontmatter.compatibility || '',
-            metadata: frontmatter.metadata || null,
-            allowedTools: frontmatter['allowed-tools'] || '',
-            userInvocable: frontmatter['user-invocable'] === true || frontmatter['user-invocable'] === 'true',
-            argumentHint: frontmatter['argument-hint'] || '',
-            context: frontmatter.context || null,
-            body,
-            filePath: skillMdPath,
-            references,
-            scripts
-          });
-        }
-      }
+  const references = [];
+  const referenceDir = path.join(skillDir, 'reference');
+  if (fs.existsSync(referenceDir)) {
+    const refFiles = fs.readdirSync(referenceDir).filter(f => f.endsWith('.md'));
+    for (const refFile of refFiles) {
+      const refPath = path.join(referenceDir, refFile);
+      references.push({
+        name: path.basename(refFile, '.md'),
+        content: fs.readFileSync(refPath, 'utf-8'),
+        filePath: refPath
+      });
     }
   }
+
+  // PER_PROJECT_SCRIPT_ARTIFACTS (defined at module top) are excluded from
+  // the distributable skill so the build never bundles one project's state
+  // into another's.
+  const scripts = [];
+  const scriptsDir = path.join(skillDir, 'scripts');
+  if (fs.existsSync(scriptsDir)) {
+    scripts.push(...readSkillScripts(scriptsDir));
+  }
+  scripts.push(...readDetectorBundleScripts(rootDir));
+
+  const agents = [];
+  const agentsDir = path.join(skillDir, 'agents');
+  if (fs.existsSync(agentsDir)) {
+    const agentFiles = fs.readdirSync(agentsDir).filter(f => f.endsWith('.md'));
+    for (const agentFile of agentFiles) {
+      const agentPath = path.join(agentsDir, agentFile);
+      const agentContent = fs.readFileSync(agentPath, 'utf-8');
+      const { frontmatter: agentFrontmatter, body: agentBody } = parseFrontmatter(agentContent);
+      const name = agentFrontmatter.name || path.basename(agentFile, '.md');
+      const providersRaw = agentFrontmatter.providers;
+      let providers = null;
+      if (Array.isArray(providersRaw)) {
+        providers = providersRaw.map(p => String(p).trim()).filter(Boolean);
+      } else if (typeof providersRaw === 'string' && providersRaw.trim()) {
+        providers = providersRaw.split(',').map(p => p.trim()).filter(Boolean);
+      }
+      agents.push({
+        name,
+        codexName: agentFrontmatter['codex-name'] || name.replace(/-/g, '_'),
+        claudeName: agentFrontmatter['claude-name'] || name,
+        description: agentFrontmatter.description || '',
+        tools: agentFrontmatter.tools || '',
+        model: agentFrontmatter.model || '',
+        effort: agentFrontmatter.effort || '',
+        maxTurns: agentFrontmatter['max-turns'] ? Number(agentFrontmatter['max-turns']) : '',
+        nicknameCandidates: agentFrontmatter['nickname-candidates'] || [],
+        providers,
+        body: agentBody,
+        filePath: agentPath,
+      });
+    }
+  }
+
+  skills.push({
+    name: frontmatter.name || 'impeccable',
+    description: frontmatter.description || '',
+    license: frontmatter.license || '',
+    compatibility: frontmatter.compatibility || '',
+    metadata: frontmatter.metadata || null,
+    allowedTools: frontmatter['allowed-tools'] || '',
+    userInvocable: frontmatter['user-invocable'] === true || frontmatter['user-invocable'] === 'true',
+    argumentHint: frontmatter['argument-hint'] || '',
+    context: frontmatter.context || null,
+    body,
+    filePath: skillMdPath,
+    references,
+    scripts,
+    agents
+  });
 
   return { skills };
 }
@@ -270,7 +369,7 @@ export function writeFile(filePath, content) {
  *   - Prose form:            `DO …`       /  `DO NOT …`
  *
  * Defaults to the main impeccable SKILL.md but accepts any relative path so
- * rules in `src/detect-antipatterns.mjs` can anchor to register-specific
+ * rules in `cli/engine/detect-antipatterns.mjs` can anchor to register-specific
  * reference files (e.g. `reference/editorial.md`) via an optional `skillFile`
  * field. Callers that don't pass `relativePath` get the legacy behavior.
  *
@@ -370,7 +469,7 @@ export function readPatterns(_rootDir, _relativePath) {
 
 // Previous SKILL.md parser retained below but disabled; kept as a
 // reference for how prefix-style extraction used to work.
-function _legacyReadPatterns(rootDir, relativePath = 'source/skills/impeccable/SKILL.md') {
+function _legacyReadPatterns(rootDir, relativePath = 'skill/SKILL.src.md') {
   const skillPath = path.join(rootDir, relativePath);
 
   if (!fs.existsSync(skillPath)) {
@@ -530,6 +629,66 @@ export const PROVIDER_PLACEHOLDERS = {
     command_prefix: '/'
   }
 };
+
+export const PROVIDER_BLOCK_TAGS = new Set([
+  'agents',
+  'claude',
+  'claude-code',
+  'codex',
+  'cursor',
+  'gemini',
+  'github',
+  'kiro',
+  'opencode',
+  'pi',
+  'qoder',
+  'rovo-dev',
+  'trae',
+  'trae-cn',
+]);
+
+/**
+ * Compile harness-conditional markdown blocks.
+ *
+ * Known provider blocks must be written as standalone tags:
+ *
+ * <codex>
+ * Codex-only instructions.
+ * </codex>
+ *
+ * Matching blocks keep their body and drop the tags. Non-matching blocks are
+ * removed. Unknown tags are preserved so ordinary markdown/HTML is untouched.
+ */
+export function compileProviderBlocks(content, activeTags = []) {
+  const activeTagSet = new Set(activeTags);
+  const providerBlockPattern = /(^|\r?\n)[ \t]*<([a-z][a-z0-9-]*)>[ \t]*\r?\n([\s\S]*?)\r?\n[ \t]*<\/\2>[ \t]*(?=\r?\n|$)/g;
+  let didCompileBlock = false;
+
+  const compiled = content.replace(providerBlockPattern, (match, prefix, tag, body) => {
+    if (!PROVIDER_BLOCK_TAGS.has(tag)) return match;
+    didCompileBlock = true;
+    return activeTagSet.has(tag) ? `${prefix}${body}` : prefix;
+  });
+
+  return didCompileBlock ? compiled.replace(/(?:\r?\n){3,}/g, '\n\n') : compiled;
+}
+
+/**
+ * Strip `<!-- rule:id -->` markers from skill markdown.
+ *
+ * External eval tooling can pin each instruction line to a stable ID.
+ * Markers in the source keep that mapping verifiable in lock-step with
+ * the file. Staged SKILL.md files should not expose them, so this strip
+ * runs during the per-provider staging in factory.js.
+ *
+ * Removes the marker plus any leading whitespace on the same line, so
+ * `something. <!-- rule:foo -->` becomes `something.` and a standalone
+ * marker line collapses to an empty line that the existing
+ * blank-line normalization in compileProviderBlocks reaps.
+ */
+export function stripRuleMarkers(content) {
+  return content.replace(/[ \t]*<!--\s*rule:[a-z0-9-]+\s*-->/g, '');
+}
 
 /**
  * Replace all {{placeholder}} tokens with provider-specific values

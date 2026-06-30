@@ -135,9 +135,9 @@ license: MIT
 
 This is a test skill body.`;
 
-    const skillDir = path.join(TEST_DIR, 'source/skills/test-skill');
+    const skillDir = path.join(TEST_DIR, 'skill');
     fs.mkdirSync(skillDir, { recursive: true });
-    fs.writeFileSync(path.join(skillDir, 'SKILL.md'), skillContent);
+    fs.writeFileSync(path.join(skillDir, 'SKILL.src.md'), skillContent);
 
     // Run the build process
     const DIST_DIR = path.join(TEST_DIR, 'dist');
@@ -162,6 +162,60 @@ This is a test skill body.`;
     expect(fs.existsSync(path.join(DIST_DIR, 'codex/.codex/skills/test-skill/SKILL.md'))).toBe(true);
   });
 
+  test('integration: emits native subagent files for Codex and Claude Code', () => {
+    const skillContent = `---
+name: test-skill
+description: A test skill
+---
+
+This is a test skill body.`;
+
+    const agentContent = `---
+name: asset-producer
+codex-name: asset_producer
+description: Produces assets from approved crops
+tools: Read, Write
+model: inherit
+effort: medium
+max-turns: 8
+nickname-candidates:
+  - Asset Plate
+---
+
+Do not redesign the approved crop.`;
+
+    const skillDir = path.join(TEST_DIR, 'skill');
+    fs.mkdirSync(path.join(skillDir, 'agents'), { recursive: true });
+    fs.writeFileSync(path.join(skillDir, 'SKILL.src.md'), skillContent);
+    fs.writeFileSync(path.join(skillDir, 'agents/asset-producer.md'), agentContent);
+
+    const DIST_DIR = path.join(TEST_DIR, 'dist');
+    const { skills } = utils.readSourceFiles(TEST_DIR);
+    const patterns = utils.readPatterns(TEST_DIR);
+
+    transformers.transformClaudeCode(skills, DIST_DIR, patterns);
+    transformers.transformCodex(skills, DIST_DIR, patterns);
+
+    const claudeAgentPath = path.join(DIST_DIR, 'claude-code/.claude/agents/asset-producer.md');
+    // Codex auto-discovers agents nested inside an installed skill, so the .toml
+    // ships in the skill's own agents/ folder rather than a top-level .codex/agents/.
+    const codexAgentPath = path.join(DIST_DIR, 'codex/.codex/skills/test-skill/agents/asset_producer.toml');
+
+    expect(fs.existsSync(claudeAgentPath)).toBe(true);
+    expect(fs.existsSync(codexAgentPath)).toBe(true);
+
+    const claudeAgent = fs.readFileSync(claudeAgentPath, 'utf-8');
+    expect(claudeAgent).toContain('name: asset-producer');
+    expect(claudeAgent).toContain('tools: Read, Write');
+    expect(claudeAgent).toContain('maxTurns: 8');
+
+    const codexAgent = fs.readFileSync(codexAgentPath, 'utf-8');
+    expect(codexAgent).toContain('name = "asset_producer"');
+    expect(codexAgent).toContain('model_reasoning_effort = "medium"');
+    expect(codexAgent).toContain('nickname_candidates = ["Asset Plate"]');
+    expect(codexAgent).toContain('developer_instructions =');
+  });
+
   test('integration: verify transformations are correct', () => {
     const skillContent = `---
 name: audit
@@ -172,9 +226,9 @@ argument-hint: "[TARGET=<value>]"
 
 Please audit {{target}} for technical quality. Ask {{model}} for help.`;
 
-    const skillDir = path.join(TEST_DIR, 'source/skills/audit');
+    const skillDir = path.join(TEST_DIR, 'skill');
     fs.mkdirSync(skillDir, { recursive: true });
-    fs.writeFileSync(path.join(skillDir, 'SKILL.md'), skillContent);
+    fs.writeFileSync(path.join(skillDir, 'SKILL.src.md'), skillContent);
 
     const DIST_DIR = path.join(TEST_DIR, 'dist');
     const { skills } = utils.readSourceFiles(TEST_DIR);
@@ -211,33 +265,6 @@ Please audit {{target}} for technical quality. Ask {{model}} for help.`;
     const codexContent = fs.readFileSync(path.join(DIST_DIR, 'codex/.codex/skills/audit/SKILL.md'), 'utf-8');
     expect(codexContent).toContain('{{target}}'); // No body transform, placeholder preserved
     expect(codexContent).toContain('GPT');
-  });
-
-  test('integration: multiple skills', () => {
-    const skill1Dir = path.join(TEST_DIR, 'source/skills/skill1');
-    fs.mkdirSync(skill1Dir, { recursive: true });
-    fs.writeFileSync(path.join(skill1Dir, 'SKILL.md'), '---\nname: skill1\n---\nSkill1');
-
-    const skill2Dir = path.join(TEST_DIR, 'source/skills/skill2');
-    fs.mkdirSync(skill2Dir, { recursive: true });
-    fs.writeFileSync(path.join(skill2Dir, 'SKILL.md'), '---\nname: skill2\n---\nSkill2');
-
-    const DIST_DIR = path.join(TEST_DIR, 'dist');
-    const { skills } = utils.readSourceFiles(TEST_DIR);
-    const patterns = utils.readPatterns(TEST_DIR);
-
-    expect(skills).toHaveLength(2);
-
-    transformers.transformCursor(skills, DIST_DIR, patterns);
-    transformers.transformClaudeCode(skills, DIST_DIR, patterns);
-    transformers.transformGemini(skills, DIST_DIR, patterns);
-    transformers.transformCodex(skills, DIST_DIR, patterns);
-
-    // Verify all files exist
-    expect(fs.existsSync(path.join(DIST_DIR, 'cursor/.cursor/skills/skill1/SKILL.md'))).toBe(true);
-    expect(fs.existsSync(path.join(DIST_DIR, 'cursor/.cursor/skills/skill2/SKILL.md'))).toBe(true);
-    expect(fs.existsSync(path.join(DIST_DIR, 'claude-code/.claude/skills/skill1/SKILL.md'))).toBe(true);
-    expect(fs.existsSync(path.join(DIST_DIR, 'claude-code/.claude/skills/skill2/SKILL.md'))).toBe(true);
   });
 
   test('should call transformers in correct order', () => {
@@ -295,5 +322,67 @@ Please audit {{target}} for technical quality. Ask {{model}} for help.`;
     expect(fs.existsSync(path.join(DIST_DIR, 'agents/.agents/skills'))).toBe(true);
     expect(fs.existsSync(path.join(DIST_DIR, 'github/.github/skills'))).toBe(true);
     expect(fs.existsSync(path.join(DIST_DIR, 'kiro/.kiro/skills'))).toBe(true);
+  });
+});
+
+// Resolve a relative import specifier against the importer's bundle-relative
+// path, mirroring Node ESM resolution against the set of bundled script names.
+// Returns the matching bundled name, or null if nothing resolves.
+function resolveBundledImport(importerName, specifier, names) {
+  const dirParts = importerName.split('/').slice(0, -1);
+  const parts = dirParts.concat(specifier.split('/'));
+  const resolved = [];
+  for (const part of parts) {
+    if (part === '' || part === '.') continue;
+    if (part === '..') { resolved.pop(); continue; }
+    resolved.push(part);
+  }
+  const base = resolved.join('/');
+  // ESM needs an explicit extension, but be tolerant of extensionless and
+  // index specifiers so the check tracks real module-resolution behavior.
+  const candidates = [base, `${base}.mjs`, `${base}.js`, `${base}/index.mjs`, `${base}/index.js`];
+  return candidates.find((c) => names.has(c)) || null;
+}
+
+// Regression guard for issue #254: the bundled detector imported
+// `../../lib/impeccable-config.mjs`, a file that lives outside `cli/engine` and
+// was never copied into the bundle, so `/impeccable critique` crashed with
+// "Cannot find module .../lib/impeccable-config.mjs". This walks every bundled
+// script and asserts each relative import resolves to another bundled file, so
+// any future out-of-bundle dependency fails the build instead of the user.
+describe('bundled skill scripts are self-contained', () => {
+  const ROOT_DIR = process.cwd();
+  const { skills } = utils.readSourceFiles(ROOT_DIR);
+  const scripts = skills[0]?.scripts ?? [];
+  const jsScripts = scripts.filter((s) => /\.(mjs|js)$/.test(s.name));
+  const names = new Set(scripts.map((s) => s.name));
+
+  // Static `import ... from '...'` and re-export `export ... from '...'` only;
+  // dynamic `import()` of computed paths (e.g. detect.mjs) is out of scope.
+  const importRe = /(?:^|[\s;])(?:import|export)\b[^'"`]*?\bfrom\s*['"]([^'"]+)['"]/g;
+
+  // Drop comments first so an example like `// import ... from '...'` in a
+  // doc comment (detector/node/file-system.mjs has one) isn't read as a real import.
+  const stripComments = (src) => src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '');
+
+  test('the detector bundle includes its config dependency', () => {
+    expect(names.has('lib/impeccable-config.mjs')).toBe(true);
+  });
+
+  test('every relative import resolves to a bundled file', () => {
+    const broken = [];
+    for (const script of jsScripts) {
+      const source = stripComments(script.content);
+      importRe.lastIndex = 0;
+      let match;
+      while ((match = importRe.exec(source)) !== null) {
+        const specifier = match[1];
+        if (!specifier.startsWith('.')) continue; // bare/node specifiers
+        if (!resolveBundledImport(script.name, specifier, names)) {
+          broken.push(`${script.name} -> ${specifier}`);
+        }
+      }
+    }
+    expect(broken).toEqual([]);
   });
 });

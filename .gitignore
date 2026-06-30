@@ -37,12 +37,38 @@ Thumbs.db
 # Cloudflare
 .wrangler/
 
-# Live mode session file + annotation screenshots (cleaned up on server stop)
+# Impeccable-owned project files are split: generated sidecars/config may be
+# tracked, but runtime recovery state and local assets should stay local.
+.impeccable/live/server.json
+.impeccable/hook.cache.json
+.impeccable/live/sessions/
+.impeccable/live/previews/
+.impeccable/live/annotations/
+.impeccable/live/cache/
+.impeccable/live/manual-edit-apply-transaction.json
+.impeccable/live/manual-edit-events.jsonl
+.impeccable/live/manual-edit-evidence/
+.impeccable/live/pending-manual-edits.json
+.impeccable/live/deferred-svelte-component-accepts.json
+.impeccable/history/
+.impeccable/config.local.json
+.impeccable/hook.pending.json
+.impeccable/provider-smoke/
+src/__impeccable_provider_smoke_*.html
+# Per-run critique snapshots are local artifacts. ignore.md (also under
+# this dir) carries deferrals the user may want to share, so it's
+# explicitly re-included below.
+.impeccable/critique/
+!.impeccable/critique/ignore.md
+
+# Legacy live mode session file + annotation screenshots
 .impeccable-live.json
 .impeccable-live/
+src/lib/impeccable/ImpeccableLiveRoot.svelte
+src/lib/impeccable/__runtime.js
 
-# Per-project live mode injection config (generated once per project by the
-# skill; wiped on skill update, regenerated on next live run)
+# Legacy per-project live mode injection config. New installs use
+# .impeccable/live/config.json in the project root instead.
 **/skills/impeccable/scripts/config.json
 
 # Extension build artifacts
@@ -58,18 +84,47 @@ extension/detector/
 evals/
 tests/evals-v2/
 
-# Generated sub-pages (built from source/skills + content/site at build time)
-public/docs/
-public/anti-patterns/
-public/tutorials/
-public/visual-mode/
-public/slop/
+# Video backlog & scripts (local working files, not for distribution)
+videos/
+
+# Talk decks & speaker materials (local working files, not for distribution)
+talks/
+
+# Generated sub-pages (legacy, now replaced by Astro content collections)
+site/public/docs/
+site/public/anti-patterns/
+site/public/tutorials/
+site/public/visual-mode/
+site/public/slop/
+
+# Build artifacts written to site/public/ so Astro copies them to build/
+site/public/_data/
+site/public/_headers
+site/public/_redirects
+site/public/_routes.json
+site/public/js/detect-antipatterns-browser.js
+site/public/js/generated/
 
 # Note: harness skill directories (.claude/skills/, .cursor/skills/, etc.)
 # are intentionally tracked. npx skills reads them from this repo at install
 # time, and they enable clean submodule use. Run `bun run build` to refresh
-# them after editing source/skills/.
+# them after editing skill/.
 #
-# Codex CLI consumes `.agents/skills/`; `.codex/` is not used. Ignore it so
-# local artifacts or old trees are never committed.
-.codex/
+# Codex CLI consumes `.agents/skills/`; the asset-producer subagent ships
+# nested inside that skill (agents/*.toml), auto-discovered on install.
+# The project-local hook manifest is the one tracked `.codex/` artifact.
+.codex/*
+!.codex/hooks.json
+.astro/
+
+# Local-only scratch for exploratory scripts, parked pages, and unused asset candidates.
+tmp/
+
+# Isolated ablation staging (impeccable-evals copies the built staged skill here
+# per rule, removes one rule, points a worker at it). Throwaway; never committed.
+.ablate-stage/
+
+# Local scratch from iterating on the OG card (weight comparisons, intermediate
+# PNGs, the old card backup). The canonical generator is `bun run og-image`
+# (scripts/generate-og-image.js); this dir is throwaway and safe to delete.
+.og-build/
